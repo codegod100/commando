@@ -35,7 +35,7 @@ impl FactoryComponent for FileItem {
                     set_halign: gtk::Align::Start,
                     set_hexpand: true,
                     set_ellipsize: gtk::pango::EllipsizeMode::End,
-                    add_css_class: if self.is_dir { "heading" } else { "" },
+                    set_css_classes: if self.is_dir { &["heading"] } else { &[] },
                 },
 
                 gtk::Label {
