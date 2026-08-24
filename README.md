@@ -9,7 +9,7 @@ This project is not affiliated with Desktop Commander.
 - Prompt bar, live action log, and workspace file browser
 - Built-in prompt library, knowledge attachments, and file preview
 - Local tools: list / read / write / edit / move / search files, run shell commands, and manage persistent interactive processes
-- Models via Ollama (default), OpenAI, Anthropic, OpenRouter, or any OpenAI-compatible server
+- Models via Ollama (default), OpenAI, a ChatGPT subscription, Anthropic, OpenRouter, or any OpenAI-compatible server
 
 ## Requirements
 
@@ -36,6 +36,10 @@ cargo run --release
 ```
 
 Settings live in `~/.config/commando/config.toml` (mode `600` because it can hold an API key). Do not commit that file.
+
+To use a ChatGPT Plus, Pro, Business, Edu, or Enterprise subscription, install
+the OpenAI Codex CLI and run `codex login`, then select **ChatGPT subscription**
+in Settings. Commando reuses the local Codex login; no API key is required.
 
 ## Safety
 

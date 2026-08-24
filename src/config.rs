@@ -9,15 +9,17 @@ use serde::{Deserialize, Serialize};
 pub enum Provider {
     Ollama,
     OpenAi,
+    ChatGpt,
     Anthropic,
     OpenRouter,
     Custom,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 5] = [
+    pub const ALL: [Provider; 6] = [
         Provider::Ollama,
         Provider::OpenAi,
+        Provider::ChatGpt,
         Provider::Anthropic,
         Provider::OpenRouter,
         Provider::Custom,
@@ -27,6 +29,7 @@ impl Provider {
         match self {
             Self::Ollama => "Ollama",
             Self::OpenAi => "OpenAI",
+            Self::ChatGpt => "ChatGPT subscription",
             Self::Anthropic => "Anthropic",
             Self::OpenRouter => "OpenRouter",
             Self::Custom => "Custom",
@@ -51,6 +54,7 @@ impl Provider {
         match self {
             Self::Ollama => "http://127.0.0.1:11434/v1",
             Self::OpenAi => "https://api.openai.com/v1",
+            Self::ChatGpt => "https://chatgpt.com/backend-api/codex",
             Self::Anthropic => "https://api.anthropic.com",
             Self::OpenRouter => "https://openrouter.ai/api/v1",
             Self::Custom => "http://127.0.0.1:1234/v1",
@@ -61,6 +65,7 @@ impl Provider {
         match self {
             Self::Ollama => "llama3.2",
             Self::OpenAi => "gpt-4.1",
+            Self::ChatGpt => "gpt-5.4",
             Self::Anthropic => "claude-sonnet-4-0",
             Self::OpenRouter => "anthropic/claude-sonnet-4",
             Self::Custom => "local-model",
@@ -71,6 +76,7 @@ impl Provider {
         match self {
             Self::Ollama => &["llama3.2", "qwen2.5-coder", "mistral", "gemma3", "deepseek-r1"],
             Self::OpenAi => &["gpt-4.1", "gpt-4o", "o4-mini", "gpt-4.1-mini"],
+            Self::ChatGpt => &["gpt-5.4", "gpt-5.4-mini"],
             Self::Anthropic => &[
                 "claude-sonnet-4-0",
                 "claude-opus-4-0",
@@ -86,7 +92,7 @@ impl Provider {
     }
 
     pub fn needs_api_key(self) -> bool {
-        !matches!(self, Self::Ollama)
+        !matches!(self, Self::Ollama | Self::ChatGpt)
     }
 }
 
@@ -150,7 +156,9 @@ impl Config {
     }
 
     pub fn ready_hint(&self) -> Option<String> {
-        if self.provider.needs_api_key() && self.api_key.trim().is_empty() {
+        if self.provider == Provider::ChatGpt && !codex_auth_path().is_file() {
+            Some("Run `codex login` to connect your ChatGPT subscription.".to_string())
+        } else if self.provider.needs_api_key() && self.api_key.trim().is_empty() {
             Some(format!(
                 "Add an API key in Settings to use {}.",
                 self.provider.as_label()
@@ -159,6 +167,14 @@ impl Config {
             None
         }
     }
+}
+
+pub fn codex_auth_path() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::UserDirs::new().map(|dirs| dirs.home_dir().join(".codex")))
+        .unwrap_or_else(|| PathBuf::from(".codex"))
+        .join("auth.json")
 }
 
 pub fn config_path() -> PathBuf {

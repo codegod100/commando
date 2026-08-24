@@ -3,18 +3,22 @@ use relm4::adw::prelude::*;
 use relm4::gtk;
 use relm4::prelude::*;
 
+use crate::agent::llm;
 use crate::config::{Config, Provider};
 
 pub struct SettingsDialog {
     pub config: Config,
     providers: gtk::StringList,
+    models: gtk::StringList,
 }
 
 #[derive(Debug)]
 pub enum SettingsMsg {
     Load(Config),
     ProviderChanged(u32),
-    ModelChanged(String),
+    ModelChanged(u32),
+    RefreshModels,
+    ModelsLoaded(Vec<String>),
     BaseUrlChanged(String),
     ApiKeyChanged(String),
     TimeoutChanged(f64),
@@ -46,7 +50,7 @@ impl Component for SettingsDialog {
 
                 add = &adw::PreferencesGroup {
                     set_title: "Model",
-                    set_description: Some("Ollama is local and free. Other providers need an API key."),
+                    set_description: Some("Use a local model, API key, or an existing Codex login."),
 
                     #[name(provider_row)]
                     adw::ComboRow {
@@ -59,13 +63,22 @@ impl Component for SettingsDialog {
                     },
 
                     #[name(model_row)]
-                    adw::EntryRow {
+                    adw::ComboRow {
                         set_title: "Model",
+                        set_model: Some(&model.models),
                         #[watch]
-                        set_tooltip_text: Some(&model.config.provider.suggested_models().join(", ")),
-                        set_text: &model.config.model,
-                        connect_changed[sender] => move |row| {
-                            sender.input(SettingsMsg::ModelChanged(row.text().to_string()));
+                        set_selected: model.model_index(),
+                        connect_selected_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::ModelChanged(row.selected()));
+                        },
+
+                        add_suffix = &gtk::Button {
+                            set_icon_name: "view-refresh-symbolic",
+                            set_tooltip_text: Some("Refresh available models"),
+                            set_valign: gtk::Align::Center,
+                            connect_clicked[sender] => move |_| {
+                                sender.input(SettingsMsg::RefreshModels);
+                            },
                         },
                     },
 
@@ -81,6 +94,8 @@ impl Component for SettingsDialog {
                     #[name(key_row)]
                     adw::PasswordEntryRow {
                         set_title: "API key",
+                        #[watch]
+                        set_visible: model.config.provider.needs_api_key(),
                         set_text: &model.config.api_key,
                         connect_changed[sender] => move |row| {
                             sender.input(SettingsMsg::ApiKeyChanged(row.text().to_string()));
@@ -144,8 +159,11 @@ impl Component for SettingsDialog {
                 .map(|provider| provider.as_label())
                 .collect::<Vec<_>>(),
         );
-        let model = SettingsDialog { config, providers };
+        let models = gtk::StringList::new(&[]);
+        let model = SettingsDialog { config, providers, models };
+        model.replace_models(model.fallback_models());
         let widgets = view_output!();
+        sender.input(SettingsMsg::RefreshModels);
         ComponentParts { model, widgets }
     }
 
@@ -160,7 +178,8 @@ impl Component for SettingsDialog {
             SettingsMsg::Load(config) => {
                 self.config = config;
                 widgets.provider_row.set_selected(self.config.provider.index());
-                widgets.model_row.set_text(&self.config.model);
+                self.replace_models(self.fallback_models());
+                widgets.model_row.set_selected(self.model_index());
                 widgets.base_row.set_text(&self.config.base_url);
                 widgets.key_row.set_text(&self.config.api_key);
                 widgets.timeout_row.set_value(self.config.timeout_secs as f64);
@@ -171,14 +190,37 @@ impl Component for SettingsDialog {
                 if provider != self.config.provider {
                     self.config.provider = provider;
                     self.config.apply_provider_defaults();
-                    widgets.model_row.set_text(&self.config.model);
+                    self.replace_models(self.fallback_models());
+                    widgets.model_row.set_selected(self.model_index());
                     widgets.base_row.set_text(&self.config.base_url);
+                    persist(&self.config, &sender);
+                    sender.input(SettingsMsg::RefreshModels);
+                }
+            }
+            SettingsMsg::ModelChanged(index) => {
+                if let Some(value) = self.models.string(index) {
+                    self.config.model = value.to_string();
                     persist(&self.config, &sender);
                 }
             }
-            SettingsMsg::ModelChanged(value) => {
-                self.config.model = value;
-                persist(&self.config, &sender);
+            SettingsMsg::RefreshModels => {
+                let config = self.config.clone();
+                let input = sender.input_sender().clone();
+                relm4::spawn_local(async move {
+                    if let Ok(models) = llm::available_models(&config).await {
+                        input.emit(SettingsMsg::ModelsLoaded(models));
+                    }
+                });
+            }
+            SettingsMsg::ModelsLoaded(models) => {
+                if !models.contains(&self.config.model) {
+                    if let Some(model) = models.first() {
+                        self.config.model = model.clone();
+                        persist(&self.config, &sender);
+                    }
+                }
+                self.replace_models(models);
+                widgets.model_row.set_selected(self.model_index());
             }
             SettingsMsg::BaseUrlChanged(value) => {
                 self.config.base_url = value;
@@ -202,6 +244,40 @@ impl Component for SettingsDialog {
             }
         }
         relm4::Component::update_view(self, widgets, sender);
+    }
+}
+
+impl SettingsDialog {
+    fn fallback_models(&self) -> Vec<String> {
+        let mut models: Vec<String> = self
+            .config
+            .provider
+            .suggested_models()
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect();
+        if !models.contains(&self.config.model) {
+            models.insert(0, self.config.model.clone());
+        }
+        models
+    }
+
+    fn replace_models(&self, models: Vec<String>) {
+        self.models.splice(
+            0,
+            self.models.n_items(),
+            &models.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+    }
+
+    fn model_index(&self) -> u32 {
+        (0..self.models.n_items())
+            .find(|index| {
+                self.models
+                    .string(*index)
+                    .is_some_and(|model| model.as_str() == self.config.model)
+            })
+            .unwrap_or(gtk::INVALID_LIST_POSITION)
     }
 }
 

@@ -1,11 +1,11 @@
-use std::time::Duration;
+use std::{fs, time::Duration};
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 use thiserror::Error;
 
 use crate::agent::tools::ToolSpec;
-use crate::config::{Config, Provider};
+use crate::config::{codex_auth_path, Config, Provider};
 
 const FALLBACK_TAG: &str = "If you cannot call tools natively, reply with one or more tags of the form:\n\
 <tool name=\"TOOL_NAME\">{...json arguments...}</tool>\n\
@@ -63,8 +63,277 @@ pub async fn complete(
 ) -> Result<Completion, LlmError> {
     match config.provider {
         Provider::Anthropic => anthropic(config, messages, tools).await,
+        Provider::ChatGpt => chatgpt(config, messages, tools).await,
         _ => openai_compatible(config, messages, tools, allow_native_tools).await,
     }
+}
+
+pub async fn available_models(config: &Config) -> Result<Vec<String>, LlmError> {
+    let mut headers = match config.provider {
+        Provider::Anthropic => {
+            let mut headers = HeaderMap::new();
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+            if !config.api_key.is_empty() {
+                headers.insert("x-api-key", header_value(&config.api_key, "API key")?);
+            }
+            headers
+        }
+        Provider::ChatGpt => chatgpt_headers()?,
+        _ => openai_headers(config)?,
+    };
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let path = if config.provider == Provider::Anthropic {
+        "v1/models"
+    } else {
+        "models"
+    };
+    let mut url = format!("{}/{}", config.base_url.trim_end_matches('/'), path);
+    if config.provider == Provider::ChatGpt {
+        // The Codex model catalog is compatibility-gated and requires this query.
+        url.push_str("?client_version=1.0.0");
+    }
+    let response = client().get(url).headers(headers).send().await?;
+    let status = response.status();
+    let payload: Value = response.json().await?;
+    if !status.is_success() {
+        return Err(provider_error(
+            config,
+            error_message(&payload, status.as_u16()),
+        ));
+    }
+
+    let rows = payload["data"]
+        .as_array()
+        .or_else(|| payload["models"].as_array())
+        .ok_or_else(|| LlmError::msg("Provider returned no model list"))?;
+    let mut models: Vec<String> = rows
+        .iter()
+        .filter(|row| row["visibility"].as_str() != Some("hide"))
+        .filter_map(|row| {
+            row["id"]
+                .as_str()
+                .or_else(|| row["slug"].as_str())
+                .or_else(|| row["model"].as_str())
+        })
+        .map(str::to_string)
+        .collect();
+    if config.provider != Provider::ChatGpt {
+        models.sort_unstable();
+    }
+    models.dedup();
+    if models.is_empty() {
+        return Err(LlmError::msg("Provider returned an empty model list"));
+    }
+    Ok(models)
+}
+
+fn chatgpt_auth() -> Result<(String, String), LlmError> {
+    let auth_path = codex_auth_path();
+    let raw = fs::read_to_string(&auth_path).map_err(|_| {
+        LlmError::msg(format!(
+            "No Codex login found at {}. Run `codex login` first.",
+            auth_path.display()
+        ))
+    })?;
+    let auth: Value = serde_json::from_str(&raw)?;
+    let tokens = auth.get("tokens").unwrap_or(&auth);
+    let access_token = tokens
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LlmError::msg("The Codex login has no access token. Run `codex login` again.")
+        })?;
+    let account_id = tokens
+        .get("account_id")
+        .or_else(|| auth.get("account_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LlmError::msg(
+                "The Codex login has no ChatGPT account ID. Run `codex login` again.",
+            )
+        })?;
+    Ok((access_token.to_string(), account_id.to_string()))
+}
+
+fn chatgpt_headers() -> Result<HeaderMap, LlmError> {
+    let (access_token, account_id) = chatgpt_auth()?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        header_value(&format!("Bearer {access_token}"), "access token")?,
+    );
+    headers.insert(
+        "ChatGPT-Account-ID",
+        header_value(&account_id, "account ID")?,
+    );
+    headers.insert("OpenAI-Beta", HeaderValue::from_static("responses=v1"));
+    headers.insert("originator", HeaderValue::from_static("commando"));
+    Ok(headers)
+}
+
+async fn chatgpt(
+    config: &Config,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+) -> Result<Completion, LlmError> {
+    let url = format!("{}/responses", config.base_url.trim_end_matches('/'));
+    let (instructions, input) = responses_input(messages);
+    let mut body = json!({
+        "model": config.model,
+        "instructions": instructions,
+        "input": input,
+        "store": false,
+        "stream": true,
+    });
+    if !tools.is_empty() {
+        body["tools"] = responses_tools(tools);
+        body["tool_choice"] = json!("auto");
+    }
+    let mut headers = chatgpt_headers()?;
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+    let response = client().post(url).headers(headers).json(&body).send().await?;
+    let status = response.status();
+    let raw = response.text().await?;
+    if !status.is_success() {
+        let payload = serde_json::from_str(&raw).unwrap_or_else(|_| json!({"error": raw}));
+        let message = error_message(&payload, status.as_u16());
+        return Err(LlmError::msg(format!(
+            "ChatGPT subscription: {message}. If authentication expired, run `codex login` again."
+        )));
+    }
+    parse_responses_stream(&raw)
+}
+
+fn responses_input(messages: &[ChatMessage]) -> (String, Value) {
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    for message in messages {
+        match message {
+            ChatMessage::System(text) => instructions.push(text.clone()),
+            ChatMessage::User(text) => input.push(json!({"role": "user", "content": text})),
+            ChatMessage::Assistant { text, tool_calls } => {
+                if !text.is_empty() {
+                    input.push(json!({"role": "assistant", "content": text}));
+                }
+                for call in tool_calls {
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": call.id,
+                        "name": call.name,
+                        "arguments": arguments_string(&call.arguments)
+                    }));
+                }
+            }
+            ChatMessage::Tool { id, content, .. } => input.push(json!({
+                "type": "function_call_output",
+                "call_id": id,
+                "output": content
+            })),
+        }
+    }
+    (instructions.join("\n\n"), Value::Array(input))
+}
+
+fn responses_tools(tools: &[ToolSpec]) -> Value {
+    Value::Array(tools.iter().map(|tool| json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+        "strict": false
+    })).collect())
+}
+
+fn parse_responses(payload: &Value) -> Result<Completion, LlmError> {
+    let output = payload["output"]
+        .as_array()
+        .ok_or_else(|| LlmError::msg("ChatGPT returned no output"))?;
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for item in output {
+        match item["type"].as_str() {
+            Some("message") => {
+                if let Some(content) = item["content"].as_array() {
+                    for part in content {
+                        if matches!(part["type"].as_str(), Some("output_text")) {
+                            if let Some(value) = part["text"].as_str() {
+                                text.push_str(value);
+                            }
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                let arguments = item["arguments"].as_str().unwrap_or("{}");
+                tool_calls.push(ToolCall {
+                    id: item["call_id"].as_str().unwrap_or_default().to_string(),
+                    name: item["name"].as_str().unwrap_or_default().to_string(),
+                    arguments: serde_json::from_str(arguments).unwrap_or_else(|_| json!({})),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(Completion { text, tool_calls })
+}
+
+fn parse_responses_stream(raw: &str) -> Result<Completion, LlmError> {
+    let mut last_error = None;
+    let mut output = Vec::new();
+    let mut text_deltas = String::new();
+    for line in raw.lines().filter_map(|line| line.strip_prefix("data:")) {
+        let data = line.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let event: Value = match serde_json::from_str(data) {
+            Ok(event) => event,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        if event["type"] == "response.output_item.done" {
+            if let Some(item) = event.get("item") {
+                output.push(item.clone());
+            }
+            continue;
+        }
+        if event["type"] == "response.output_text.delta" {
+            if let Some(delta) = event["delta"].as_str() {
+                text_deltas.push_str(delta);
+            }
+            continue;
+        }
+        if event["type"] == "response.completed" {
+            if event["response"]["output"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+            {
+                return parse_responses(&event["response"]);
+            }
+            if !output.is_empty() {
+                return parse_responses(&json!({"output": output}));
+            }
+            if !text_deltas.is_empty() {
+                return Ok(Completion {
+                    text: text_deltas,
+                    tool_calls: Vec::new(),
+                });
+            }
+            return Err(LlmError::msg("ChatGPT completed without producing output"));
+        }
+        if event["type"] == "response.failed" {
+            return Err(LlmError::msg(error_message(&event["response"], 500)));
+        }
+    }
+    if let Ok(payload) = serde_json::from_str(raw) {
+        return parse_responses(&payload);
+    }
+    Err(last_error
+        .map(LlmError::Json)
+        .unwrap_or_else(|| LlmError::msg("ChatGPT returned an incomplete streamed response")))
 }
 
 async fn openai_compatible(
@@ -460,6 +729,7 @@ fn error_message(payload: &Value, status: u16) -> String {
     payload
         .pointer("/error/message")
         .or_else(|| payload.pointer("/error"))
+        .or_else(|| payload.pointer("/detail"))
         .and_then(|value| match value {
             Value::String(text) => Some(text.clone()),
             other => Some(other.to_string()),
@@ -526,5 +796,18 @@ mod tests {
         let completion = parse_openai(&payload).unwrap();
         assert_eq!(completion.tool_calls[0].name, "run_command");
         assert_eq!(completion.tool_calls[0].arguments["command"], "ls");
+    }
+
+    #[test]
+    fn parses_chatgpt_responses_stream() {
+        let raw = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":",
+            "{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n"
+        );
+        let completion = parse_responses_stream(raw).unwrap();
+        assert_eq!(completion.text, "done");
     }
 }
