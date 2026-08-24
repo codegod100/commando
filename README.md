@@ -37,6 +37,24 @@ cargo run --release
 
 Settings live in `~/.config/commando/config.toml` (mode `600` because it can hold an API key). Do not commit that file.
 
+## Flatpak
+
+Build and install the local Flatpak with:
+
+```bash
+flatpak-builder --force-clean --user --install build-dir app.commando.Commando.yml
+flatpak run app.commando.Commando
+```
+
+The manifest uses the GNOME 49 runtime and downloads the dependencies pinned in
+`Cargo.lock` while building. Install the SDK first if it is not already
+available:
+
+```bash
+flatpak install flathub org.gnome.Platform//49 org.gnome.Sdk//49 \
+  org.freedesktop.Sdk.Extension.rust-stable//25.08
+```
+
 To use a ChatGPT Plus, Pro, Business, Edu, or Enterprise subscription, install
 the OpenAI Codex CLI and run `codex login`, then select **ChatGPT subscription**
 in Settings. Commando reuses the local Codex login; no API key is required.

@@ -1,0 +1,41 @@
+app-id: app.commando.Commando
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: commando
+
+finish-args:
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Commando operates on workspaces selected by the user.
+  - --filesystem=host
+
+build-options:
+  # This local-development manifest downloads locked Cargo dependencies.
+  # A Flathub submission should replace this with generated vendored sources.
+  build-args:
+    - --share=network
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/commando/cargo
+
+modules:
+  - name: commando
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked
+      - install -Dm755 target/release/commando /app/bin/commando
+      - install -Dm644 data/app.commando.Commando.desktop /app/share/applications/app.commando.Commando.desktop
+      - install -Dm644 data/app.commando.Commando.metainfo.xml /app/share/metainfo/app.commando.Commando.metainfo.xml
+      - install -Dm644 data/icons/hicolor/scalable/apps/app.commando.Commando.svg /app/share/icons/hicolor/scalable/apps/app.commando.Commando.svg
+    sources:
+      - type: dir
+        path: .
+        skip:
+          - .flatpak-builder
+          - build-dir
+          - target

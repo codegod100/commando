@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="18" y1="13" x2="110" y2="115" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7C5CFC"/>
+      <stop offset="1" stop-color="#3D27A8"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="37" y1="38" x2="91" y2="92" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D9D2FF"/>
+    </linearGradient>
+  </defs>
+  <!-- A rounded command tile: legible at launcher and dock sizes. -->
+  <rect x="8" y="8" width="112" height="112" rx="27" fill="url(#bg)"/>
+  <path d="M20 55C24 31 43 18 67 18c19 0 34 8 43 23" fill="none"
+        stroke="#A997FF" stroke-width="5" stroke-linecap="round" opacity=".55"/>
+  <!-- Prompt chevron and cursor form a compact C for Commando. -->
+  <path d="M39 41 62 64 39 87" fill="none" stroke="url(#shine)"
+        stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M67 87h25" fill="none" stroke="#FFFFFF" stroke-width="12"
+        stroke-linecap="round"/>
+  <circle cx="101" cy="31" r="7" fill="#62E6B7"/>
+</svg>

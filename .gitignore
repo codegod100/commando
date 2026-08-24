@@ -1,4 +1,6 @@
 /target
+/build-dir
+/.flatpak-builder
 **/*.rs.bk
 .idea/
 .vscode/
