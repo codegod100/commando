@@ -135,6 +135,16 @@ fn tool_preview(name: &str, args: &serde_json::Value) -> String {
             .and_then(|value| value.as_str())
             .map(|value| format!("`{value}`"))
             .unwrap_or_else(|| args.to_string()),
+        "start_process" => args
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(|value| format!("`{value}`"))
+            .unwrap_or_else(|| args.to_string()),
+        "interact_with_process" | "kill_process" => format!(
+            "session {}",
+            args.get("session_id").and_then(|value| value.as_u64()).map(|id| id.to_string()).unwrap_or_else(|| "?".into())
+        ),
+        "list_processes" => String::new(),
         "read_file" | "write_file" | "edit_file" | "file_info" | "delete_path"
         | "create_directory" | "list_directory" => args
             .get("path")

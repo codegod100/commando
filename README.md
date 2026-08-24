@@ -8,7 +8,7 @@ This project is not affiliated with Desktop Commander.
 
 - Prompt bar, live action log, and workspace file browser
 - Built-in prompt library, knowledge attachments, and file preview
-- Local tools: list / read / write / edit / move / search files and run shell commands
+- Local tools: list / read / write / edit / move / search files, run shell commands, and manage persistent interactive processes
 - Models via Ollama (default), OpenAI, Anthropic, OpenRouter, or any OpenAI-compatible server
 
 ## Requirements

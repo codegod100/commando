@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use globset::GlobBuilder;
 use serde_json::{json, Value};
-use tokio::process::Command;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::Mutex;
 use walkdir::WalkDir;
 
 use crate::agent::safety;
@@ -16,6 +20,26 @@ const MAX_TEXT_BYTES: u64 = 256 * 1024;
 const MAX_SEARCH_HITS: usize = 80;
 const MAX_LIST_ENTRIES: usize = 400;
 const MAX_COMMAND_CHARS: usize = 24_000;
+const SESSION_READ_DELAY_MS: u64 = 150;
+
+struct ProcessSession {
+    command: String,
+    child: Child,
+    stdin: Option<ChildStdin>,
+    output: Arc<Mutex<Vec<u8>>>,
+    read_offset: usize,
+}
+
+#[derive(Default)]
+struct ProcessManager {
+    next_id: u64,
+    sessions: HashMap<u64, ProcessSession>,
+}
+
+fn process_manager() -> &'static Mutex<ProcessManager> {
+    static MANAGER: OnceLock<Mutex<ProcessManager>> = OnceLock::new();
+    MANAGER.get_or_init(|| Mutex::new(ProcessManager::default()))
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
@@ -179,6 +203,57 @@ pub fn catalog() -> Vec<ToolSpec> {
                 )],
             ),
         },
+        ToolSpec {
+            name: "start_process",
+            description: "Start a persistent shell process and return a session ID. Use for servers, REPLs, debuggers, and commands that need later input.",
+            parameters: object_schema(
+                &[(
+                    "command",
+                    json!({"type": "string"}),
+                    true,
+                ),
+                (
+                    "cwd",
+                    json!({"type": "string", "description": "Working directory. Defaults to the workspace."}),
+                    false,
+                )],
+            ),
+        },
+        ToolSpec {
+            name: "interact_with_process",
+            description: "Send input to a persistent process and read output produced since the previous interaction. Omit input to poll output.",
+            parameters: object_schema(
+                &[(
+                    "session_id",
+                    json!({"type": "integer"}),
+                    true,
+                ),
+                (
+                    "input",
+                    json!({"type": "string", "description": "Text sent to stdin. A newline is appended unless input already ends with one."}),
+                    false,
+                ),
+                (
+                    "wait_ms",
+                    json!({"type": "integer", "description": "Time to wait for output after sending input. Default 150, max 5000."}),
+                    false,
+                )],
+            ),
+        },
+        ToolSpec {
+            name: "list_processes",
+            description: "List persistent process sessions started by this app and whether each is running or exited.",
+            parameters: object_schema(&[]),
+        },
+        ToolSpec {
+            name: "kill_process",
+            description: "Terminate and remove a persistent process session.",
+            parameters: object_schema(&[(
+                "session_id",
+                json!({"type": "integer"}),
+                true,
+            )]),
+        },
     ]
 }
 
@@ -268,6 +343,24 @@ pub async fn execute(name: &str, args: &Value, workspace: &Path, timeout: Durati
             let cwd = arg_path(args, "cwd", workspace);
             run_command(command, &cwd, timeout).await
         }
+        "start_process" => {
+            let command = args.get("command").and_then(Value::as_str).unwrap_or("").trim();
+            if command.is_empty() {
+                return ToolOutcome::err("start_process needs a command");
+            }
+            if let Some(reason) = safety::blocked_command(command) {
+                return ToolOutcome::err(format!("Blocked command matching `{reason}`"));
+            }
+            start_process(command, &arg_path(args, "cwd", workspace)).await
+        }
+        "interact_with_process" => interact_with_process(
+            args.get("session_id").and_then(Value::as_u64),
+            args.get("input").and_then(Value::as_str),
+            args.get("wait_ms").and_then(Value::as_u64),
+        )
+        .await,
+        "list_processes" => list_processes().await,
+        "kill_process" => kill_process(args.get("session_id").and_then(Value::as_u64)).await,
         other => ToolOutcome::err(format!("Unknown tool `{other}`")),
     }
 }
@@ -623,6 +716,163 @@ async fn run_command(command: &str, cwd: &Path, timeout: Duration) -> ToolOutcom
     }
 }
 
+async fn start_process(command: &str, cwd: &Path) -> ToolOutcome {
+    if !cwd.exists() {
+        return ToolOutcome::err(format!("Working directory not found: {}", cwd.display()));
+    }
+    let mut child = match Command::new("bash")
+        .arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return ToolOutcome::err(format!("Failed to start process: {error}")),
+    };
+    let stdin = child.stdin.take();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    if let Some(stdout) = child.stdout.take() {
+        collect_process_output(stdout, Arc::clone(&output), None);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        collect_process_output(stderr, Arc::clone(&output), Some(b"\n--- stderr ---\n"));
+    }
+
+    let mut manager = process_manager().lock().await;
+    manager.next_id += 1;
+    let id = manager.next_id;
+    manager.sessions.insert(
+        id,
+        ProcessSession {
+            command: command.to_string(),
+            child,
+            stdin,
+            output,
+            read_offset: 0,
+        },
+    );
+    ToolOutcome::ok(
+        format!("Started session {id}: `{command}`"),
+        format!("session_id: {id}\nUse interact_with_process to read output or send input."),
+    )
+}
+
+fn collect_process_output<R>(mut reader: R, output: Arc<Mutex<Vec<u8>>>, prefix: Option<&'static [u8]>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut first = true;
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    let mut output = output.lock().await;
+                    if first {
+                        if let Some(prefix) = prefix {
+                            output.extend_from_slice(prefix);
+                        }
+                        first = false;
+                    }
+                    output.extend_from_slice(&chunk[..count]);
+                }
+            }
+        }
+    });
+}
+
+async fn interact_with_process(
+    id: Option<u64>,
+    input: Option<&str>,
+    wait_ms: Option<u64>,
+) -> ToolOutcome {
+    let Some(id) = id else {
+        return ToolOutcome::err("interact_with_process needs a session_id");
+    };
+    let mut manager = process_manager().lock().await;
+    let Some(session) = manager.sessions.get_mut(&id) else {
+        return ToolOutcome::err(format!("Process session {id} not found"));
+    };
+    if let Some(input) = input {
+        let Some(stdin) = session.stdin.as_mut() else {
+            return ToolOutcome::err(format!("Process session {id} has no open stdin"));
+        };
+        if let Err(error) = stdin.write_all(input.as_bytes()).await {
+            return ToolOutcome::err(format!("Cannot write to process session {id}: {error}"));
+        }
+        if !input.ends_with('\n') {
+            if let Err(error) = stdin.write_all(b"\n").await {
+                return ToolOutcome::err(format!("Cannot write to process session {id}: {error}"));
+            }
+        }
+        if let Err(error) = stdin.flush().await {
+            return ToolOutcome::err(format!("Cannot flush process session {id}: {error}"));
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(
+        wait_ms.unwrap_or(SESSION_READ_DELAY_MS).min(5_000),
+    ))
+    .await;
+    let status = match session.child.try_wait() {
+        Ok(Some(status)) => format!("exited {}", status.code().unwrap_or(-1)),
+        Ok(None) => "running".to_string(),
+        Err(error) => return ToolOutcome::err(format!("Cannot inspect process session {id}: {error}")),
+    };
+    let output = session.output.lock().await;
+    let unread = &output[session.read_offset.min(output.len())..];
+    let detail = if unread.is_empty() {
+        "(no new output)".to_string()
+    } else {
+        truncate(&String::from_utf8_lossy(unread), MAX_COMMAND_CHARS)
+    };
+    session.read_offset = output.len();
+    ToolOutcome::ok(format!("Session {id} is {status}"), detail)
+}
+
+async fn list_processes() -> ToolOutcome {
+    let mut manager = process_manager().lock().await;
+    if manager.sessions.is_empty() {
+        return ToolOutcome::ok("No process sessions", "(none)");
+    }
+    let mut lines = Vec::new();
+    for (id, session) in &mut manager.sessions {
+        let status = match session.child.try_wait() {
+            Ok(Some(status)) => format!("exited {}", status.code().unwrap_or(-1)),
+            Ok(None) => "running".to_string(),
+            Err(error) => format!("unknown ({error})"),
+        };
+        lines.push(format!("{id}\t{status}\t{}", session.command));
+    }
+    lines.sort();
+    ToolOutcome::ok(format!("{} process sessions", lines.len()), lines.join("\n"))
+}
+
+async fn kill_process(id: Option<u64>) -> ToolOutcome {
+    let Some(id) = id else {
+        return ToolOutcome::err("kill_process needs a session_id");
+    };
+    let mut manager = process_manager().lock().await;
+    let Some(mut session) = manager.sessions.remove(&id) else {
+        return ToolOutcome::err(format!("Process session {id} not found"));
+    };
+    match session.child.kill().await {
+        Ok(()) => ToolOutcome::ok(
+            format!("Killed process session {id}"),
+            format!("Killed `{}`", session.command),
+        ),
+        Err(_) if session.child.try_wait().ok().flatten().is_some() => ToolOutcome::ok(
+            format!("Removed exited process session {id}"),
+            format!("Removed `{}`", session.command),
+        ),
+        Err(error) => ToolOutcome::err(format!("Cannot kill process session {id}: {error}")),
+    }
+}
+
 fn read_text_lossy(path: &Path) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut buf = Vec::new();
@@ -706,5 +956,24 @@ mod tests {
         let path = dir.path().join("dup.txt");
         fs::write(&path, "foo foo").unwrap();
         assert!(!edit_file(&path, "foo", "bar").ok);
+    }
+
+    #[tokio::test]
+    async fn persistent_process_accepts_input_and_streams_output() {
+        let dir = tempdir().unwrap();
+        let started = start_process("while read line; do echo reply:$line; done", dir.path()).await;
+        assert!(started.ok, "{}", started.detail);
+        let id = started
+            .detail
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("session_id: "))
+            .and_then(|id| id.parse().ok())
+            .unwrap();
+
+        let interaction = interact_with_process(Some(id), Some("hello"), Some(500)).await;
+        assert!(interaction.ok, "{}", interaction.detail);
+        assert!(interaction.detail.contains("reply:hello"));
+        assert!(kill_process(Some(id)).await.ok);
     }
 }
