@@ -24,6 +24,7 @@ pub enum AgentEvent {
 
 pub struct AgentRequest {
     pub prompt: String,
+    pub image: Option<Vec<u8>>,
     pub knowledge: Vec<String>,
     pub config: Config,
     pub workspace: PathBuf,
@@ -40,7 +41,13 @@ pub async fn run(request: AgentRequest, emit: impl Fn(AgentEvent)) {
             &library::system_prompt(&display_path(&request.workspace), &request.knowledge),
         )));
     }
-    messages.push(ChatMessage::User(request.prompt));
+    messages.push(match request.image {
+        Some(png) => ChatMessage::UserImage {
+            text: request.prompt,
+            png,
+        },
+        None => ChatMessage::User(request.prompt),
+    });
 
     let timeout = Duration::from_secs(request.config.timeout_secs.max(5));
     let max_iterations = request.config.max_iterations.max(1);

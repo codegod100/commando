@@ -1,5 +1,6 @@
 use std::{fs, time::Duration};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -22,6 +23,7 @@ pub struct ToolCall {
 pub enum ChatMessage {
     System(String),
     User(String),
+    UserImage { text: String, png: Vec<u8> },
     Assistant {
         text: String,
         tool_calls: Vec<ToolCall>,
@@ -212,6 +214,13 @@ fn responses_input(messages: &[ChatMessage]) -> (String, Value) {
         match message {
             ChatMessage::System(text) => instructions.push(text.clone()),
             ChatMessage::User(text) => input.push(json!({"role": "user", "content": text})),
+            ChatMessage::UserImage { text, png } => input.push(json!({
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": text},
+                    {"type": "input_image", "image_url": png_data_url(png)}
+                ]
+            })),
             ChatMessage::Assistant { text, tool_calls } => {
                 if !text.is_empty() {
                     input.push(json!({"role": "assistant", "content": text}));
@@ -436,12 +445,23 @@ fn header_value(value: &str, label: &str) -> Result<HeaderValue, LlmError> {
     HeaderValue::from_str(value).map_err(|_| LlmError::msg(format!("Invalid {label}")))
 }
 
+fn png_data_url(png: &[u8]) -> String {
+    format!("data:image/png;base64,{}", BASE64.encode(png))
+}
+
 fn openai_messages(messages: &[ChatMessage]) -> Value {
     let rows: Vec<Value> = messages
         .iter()
         .map(|message| match message {
             ChatMessage::System(text) => json!({"role": "system", "content": text}),
             ChatMessage::User(text) => json!({"role": "user", "content": text}),
+            ChatMessage::UserImage { text, png } => json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "image_url", "image_url": {"url": png_data_url(png)}}
+                ]
+            }),
             ChatMessage::Assistant { text, tool_calls } if tool_calls.is_empty() => {
                 json!({"role": "assistant", "content": text})
             }
@@ -510,6 +530,15 @@ fn anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Value) {
             ChatMessage::User(text) => rows.push(json!({
                 "role": "user",
                 "content": [{"type": "text", "text": text}]
+            })),
+            ChatMessage::UserImage { text, png } => rows.push(json!({
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": BASE64.encode(png)
+                    }},
+                    {"type": "text", "text": text}
+                ]
             })),
             ChatMessage::Assistant { text, tool_calls } => {
                 let mut content = Vec::new();

@@ -31,6 +31,7 @@ pub struct App {
     stop: Arc<AtomicBool>,
     turns: Vec<(String, String)>,
     pending_prompt: Option<String>,
+    pasted_image: Option<Vec<u8>>,
     last_assistant: String,
     settings: Controller<SettingsDialog>,
     prompts: Controller<PromptPicker>,
@@ -40,6 +41,7 @@ pub struct App {
 pub enum AppMsg {
     Submit,
     UsePrompt(String),
+    ImagePasted(Vec<u8>),
     PickWorkspace,
     WorkspacePicked(PathBuf),
     GoParent,
@@ -154,6 +156,18 @@ impl Component for App {
                                         sender.input(AppMsg::Submit);
                                     },
                                 }
+                            },
+
+                            #[name(pasted_preview)]
+                            gtk::Picture {
+                                set_halign: gtk::Align::Start,
+                                set_width_request: 160,
+                                set_height_request: 100,
+                                set_content_fit: gtk::ContentFit::Contain,
+                                set_can_shrink: true,
+                                set_tooltip_text: Some("Pasted image attached"),
+                                #[watch]
+                                set_visible: model.pasted_image.is_some(),
                             },
 
                             gtk::Box {
@@ -350,6 +364,7 @@ impl Component for App {
             stop: Arc::new(AtomicBool::new(false)),
             turns: Vec::new(),
             pending_prompt: None,
+            pasted_image: None,
             last_assistant: String::new(),
             settings,
             prompts,
@@ -359,6 +374,35 @@ impl Component for App {
         let file_list = model.files.widget();
         let log_box = model.log.widget();
         let widgets = view_output!();
+        let key = gtk::EventControllerKey::new();
+        // Run before Entry's built-in Ctrl+V handler, which otherwise consumes
+        // the event before custom clipboard formats can be inspected.
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let clipboard = widgets.prompt.clipboard();
+        let input = sender.input_sender().clone();
+        key.connect_key_pressed(move |_, key, _, modifiers| {
+            if key == gtk::gdk::Key::v
+                && modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                && {
+                    let formats = clipboard.formats();
+                    formats.contains_type(gtk::gdk::Texture::static_type())
+                        || formats
+                            .mime_types()
+                            .iter()
+                            .any(|mime| mime.starts_with("image/"))
+                }
+            {
+                let input = input.clone();
+                clipboard.read_texture_async(None::<&gtk::gio::Cancellable>, move |result| {
+                    if let Ok(Some(texture)) = result {
+                        input.emit(AppMsg::ImagePasted(texture.save_to_png_bytes().to_vec()));
+                    }
+                });
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        widgets.prompt.add_controller(key);
         widgets.stack.set_visible_child_name("welcome");
         ComponentParts { model, widgets }
     }
@@ -384,6 +428,18 @@ impl Component for App {
                 self.prompts.widget().close();
                 widgets.prompt.set_text(&text);
                 widgets.prompt.grab_focus();
+            }
+            AppMsg::ImagePasted(png) => {
+                let bytes = gtk::glib::Bytes::from_owned(png.clone());
+                match gtk::gdk::Texture::from_bytes(&bytes) {
+                    Ok(texture) => {
+                        widgets.pasted_preview.set_paintable(Some(&texture));
+                        self.pasted_image = Some(png);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to preview pasted image");
+                    }
+                }
             }
             AppMsg::PickWorkspace => pick_workspace(root, sender.clone()),
             AppMsg::WorkspacePicked(path) => {
@@ -439,6 +495,7 @@ impl Component for App {
                 self.status = "Ready".into();
                 self.turns.clear();
                 self.pending_prompt = None;
+                self.pasted_image = None;
                 self.last_assistant.clear();
                 self.log.guard().clear();
                 self.log_empty = true;
@@ -499,6 +556,7 @@ impl App {
         let knowledge = knowledge_blobs(&self.knowledge);
         let request = AgentRequest {
             prompt,
+            image: self.pasted_image.take(),
             knowledge,
             config: self.config.clone(),
             workspace: self.workspace.clone(),
